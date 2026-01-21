@@ -1,5 +1,7 @@
 # 🔑 KeyHunter
 
+[![Crates.io](https://img.shields.io/crates/v/github-keyhunter?style=flat-square)](https://crates.io/crates/github-keyhunter)
+[![Downloads](https://img.shields.io/crates/d/github-keyhunter?style=flat-square)](https://crates.io/crates/github-keyhunter)
 [![GitHub stars](https://img.shields.io/github/stars/fadidevv/keyhunter?style=flat-square)](https://github.com/fadidevv/keyhunter/stargazers)
 [![GitHub forks](https://img.shields.io/github/forks/fadidevv/keyhunter?style=flat-square)](https://github.com/fadidevv/keyhunter/network)
 [![GitHub issues](https://img.shields.io/github/issues/fadidevv/keyhunter?style=flat-square)](https://github.com/fadidevv/keyhunter/issues)
@@ -121,7 +123,16 @@ tokens = [
 
 ### 3. Choose Your Installation
 
-#### Option A: With Rust (Native)
+#### Option A: Install from crates.io (Recommended)
+
+```bash
+cargo install github-keyhunter
+
+# Run
+keyhunter scan -p openai
+```
+
+#### Option B: Build from Source
 
 ```bash
 # Build (first time takes ~2 min)
@@ -131,7 +142,7 @@ cargo build --release
 ./target/release/keyhunter scan -p openai
 ```
 
-#### Option B: With Docker (No Rust Required)
+#### Option C: With Docker (No Rust Required)
 
 ```bash
 # Build image (~3-5 min first time)

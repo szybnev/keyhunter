@@ -1,5 +1,5 @@
 [package]
-name = "keyhunter"
+name = "github-keyhunter"
 version = "0.1.0"
 edition = "2021"
 description = "Fast GitHub API key leak scanner"

@@ -503,6 +503,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "github-keyhunter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "clap",
+ "colored",
+ "comfy-table",
+ "ctrlc",
+ "futures",
+ "indicatif",
+ "lazy_static",
+ "rand",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "urlencoding",
+]
+
+[[package]]
 name = "h2"
 version = "0.3.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -781,30 +805,6 @@ checksum = "8c942ebf8e95485ca0d52d97da7c5a2c387d0e7f0ba4c35e93bfcaee045955b3"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
-]
-
-[[package]]
-name = "keyhunter"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64",
- "chrono",
- "clap",
- "colored",
- "comfy-table",
- "ctrlc",
- "futures",
- "indicatif",
- "lazy_static",
- "rand",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "toml",
- "urlencoding",
 ]
 
 [[package]]
