@@ -1,5 +1,10 @@
 # 🔑 KeyHunter
 
+[![GitHub stars](https://img.shields.io/github/stars/fadidevv/keyhunter?style=flat-square)](https://github.com/fadidevv/keyhunter/stargazers)
+[![GitHub forks](https://img.shields.io/github/forks/fadidevv/keyhunter?style=flat-square)](https://github.com/fadidevv/keyhunter/network)
+[![GitHub issues](https://img.shields.io/github/issues/fadidevv/keyhunter?style=flat-square)](https://github.com/fadidevv/keyhunter/issues)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
+
 Fast GitHub API key leak scanner written in Rust. Find exposed API keys and help developers secure their secrets.
 
 <p align="center">
