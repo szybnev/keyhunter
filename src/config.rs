@@ -17,13 +17,70 @@ use std::path::Path;
 pub struct Config {
     /// GitHub API configuration
     pub github: GitHubConfig,
+    /// Optional GitLab.com source configuration.
+    #[serde(default)]
+    pub gitlab: Option<GitLabConfig>,
     /// Scan behavior settings
     pub scan: ScanConfig,
     /// Output and file saving settings
     pub output: OutputConfig,
+    /// Persistent storage and data-retention settings.
+    #[serde(default)]
+    pub storage: StorageConfig,
+    /// Settings for the autonomous Docker daemon.
+    #[serde(default)]
+    pub daemon: DaemonConfig,
     /// Per-provider enable/disable toggles
     #[serde(default)]
     pub providers: ProvidersConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct GitLabConfig {
+    pub tokens: Vec<String>,
+    #[serde(default = "default_concurrency")]
+    pub concurrency: usize,
+    #[serde(default = "default_delay")]
+    pub delay_ms: u64,
+    #[serde(default = "default_gitlab_budget")]
+    pub requests_per_hour: usize,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct StorageConfig {
+    #[serde(default = "default_database_path")]
+    pub database_path: String,
+    #[serde(default = "default_retention_days")]
+    pub retention_days: i64,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            database_path: default_database_path(),
+            retention_days: default_retention_days(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct DaemonConfig {
+    #[serde(default = "default_interval_minutes")]
+    pub interval_minutes: u64,
+    #[serde(default = "default_github_budget")]
+    pub github_requests_per_hour: usize,
+    #[serde(default = "default_true")]
+    pub verify_new: bool,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            interval_minutes: default_interval_minutes(),
+            github_requests_per_hour: default_github_budget(),
+            verify_new: true,
+        }
+    }
 }
 
 /// GitHub API configuration.
@@ -274,6 +331,21 @@ fn default_delay() -> u64 {
 /// Default max results per query (1000)
 fn default_max_results() -> usize {
     1000
+}
+fn default_database_path() -> String {
+    "results/keyhunter.sqlite3".to_string()
+}
+fn default_retention_days() -> i64 {
+    90
+}
+fn default_interval_minutes() -> u64 {
+    60
+}
+fn default_github_budget() -> usize {
+    480
+}
+fn default_gitlab_budget() -> usize {
+    480
 }
 
 /// Default output directory ("results")

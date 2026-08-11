@@ -26,6 +26,8 @@ pub struct GitHubClient {
     semaphore: Arc<Semaphore>,
     /// Delay between requests in milliseconds
     delay_ms: u64,
+    request_count: Arc<AtomicUsize>,
+    max_requests: usize,
 }
 
 /// Response from GitHub code search API.
@@ -152,7 +154,12 @@ impl GitHubClient {
     ///
     /// # Returns
     /// * `Result<GitHubClient>` - Configured client or error
-    pub fn new(tokens: Vec<String>, concurrency: usize, delay_ms: u64) -> Result<Self> {
+    pub fn new(
+        tokens: Vec<String>,
+        concurrency: usize,
+        delay_ms: u64,
+        max_requests: usize,
+    ) -> Result<Self> {
         let mut clients = Vec::new();
 
         // Create one HTTP client per token
@@ -185,6 +192,8 @@ impl GitHubClient {
             current_token: Arc::new(AtomicUsize::new(0)),
             semaphore: Arc::new(Semaphore::new(concurrency)),
             delay_ms,
+            request_count: Arc::new(AtomicUsize::new(0)),
+            max_requests,
         })
     }
 
@@ -194,6 +203,13 @@ impl GitHubClient {
     fn get_client(&self) -> &Client {
         let idx = self.current_token.fetch_add(1, Ordering::SeqCst) % self.clients.len();
         &self.clients[idx]
+    }
+
+    fn reserve_request(&self) -> Result<()> {
+        if self.request_count.fetch_add(1, Ordering::SeqCst) >= self.max_requests {
+            anyhow::bail!("GitHub request budget exhausted for this hourly run");
+        }
+        Ok(())
     }
 
     /// Searches GitHub code with the given query.
@@ -216,6 +232,7 @@ impl GitHubClient {
         page: u32,
         per_page: u32,
     ) -> Result<SearchResponse> {
+        self.reserve_request()?;
         // Acquire semaphore permit for concurrency control
         let _permit = self.semaphore.acquire().await?;
 
@@ -346,6 +363,7 @@ impl GitHubClient {
     /// # Returns
     /// * `Result<String>` - Raw file content or error
     pub async fn get_raw_content(&self, html_url: &str) -> Result<String> {
+        self.reserve_request()?;
         let _permit = self.semaphore.acquire().await?;
 
         // Convert github.com URL to raw.githubusercontent.com
@@ -381,6 +399,7 @@ impl GitHubClient {
     /// * `Result<String>` - Decoded file content or error
     #[allow(dead_code)]
     pub async fn get_file_content(&self, url: &str) -> Result<String> {
+        self.reserve_request()?;
         let _permit = self.semaphore.acquire().await?;
 
         let client = self.get_client();

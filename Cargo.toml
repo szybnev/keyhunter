@@ -28,6 +28,8 @@ rand = "0.8"
 lazy_static = "1.4"
 urlencoding = "2.1"
 ctrlc = "3.4"
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
+sha2 = "0.10"
 
 [[bin]]
 name = "keyhunter"

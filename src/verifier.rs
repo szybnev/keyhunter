@@ -64,6 +64,25 @@ impl Verifier {
         Ok(Self { client, concurrent })
     }
 
+    /// Verifies every supplied finding and returns both active and inactive results.
+    /// Autonomous mode persists these statuses instead of emitting secret-bearing output.
+    pub async fn verify_all(&self, findings: Vec<KeyFinding>) -> Vec<VerifiedKey> {
+        let mut verified = Vec::new();
+        for chunk in findings.chunks(self.concurrent) {
+            let tasks: Vec<_> = chunk
+                .iter()
+                .map(|finding| {
+                    let client = self.client.clone();
+                    let finding = finding.clone();
+                    async move { Self::verify_single(&client, finding).await }
+                })
+                .collect();
+            verified.extend(join_all(tasks).await.into_iter().filter_map(Result::ok));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        verified
+    }
+
     /// Verifies keys loaded from a JSON file.
     ///
     /// Loads findings from a file, optionally filters by provider,

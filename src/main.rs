@@ -26,9 +26,12 @@ use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Cell, Color
 use std::path::PathBuf;
 
 mod config;
+mod daemon;
 mod github;
+mod gitlab;
 mod patterns;
 mod scanner;
+mod storage;
 mod verifier;
 
 use config::Config;
@@ -113,6 +116,16 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
+    /// Run an autonomous, persistent hourly scan scheduler.
+    Daemon {
+        /// Config file path
+        #[arg(short, long, default_value = "config.toml")]
+        config: PathBuf,
+        /// Show detailed progress while a scheduled scan is running
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
     /// Show supported providers and patterns
     Patterns,
 }
@@ -153,9 +166,13 @@ async fn main() -> Result<()> {
 
             // Execute scan - either custom query or provider-based
             let findings = if let Some(q) = query {
-                scanner.search_custom(&q, &output_format, skip_output).await?
+                scanner
+                    .search_custom(&q, &output_format, skip_output)
+                    .await?
             } else {
-                scanner.scan_all(&provider, &output_format, skip_output).await?
+                scanner
+                    .scan_sources(&provider, &output_format, skip_output)
+                    .await?
             };
 
             // If --verified-only flag, verify and filter to active keys only
@@ -165,7 +182,9 @@ async fn main() -> Result<()> {
                 let verifier = Verifier::new(5)?;
                 let limit = if verify_all { None } else { Some(50) };
 
-                verifier.verify_and_filter(findings, limit, &output_format).await?;
+                verifier
+                    .verify_and_filter(findings, limit, &output_format)
+                    .await?;
             }
         }
         Commands::Verify {
@@ -195,6 +214,10 @@ async fn main() -> Result<()> {
         }
         Commands::Patterns => {
             show_patterns();
+        }
+        Commands::Daemon { config, verbose } => {
+            let cfg = Config::load(&config).context("Failed to load config file")?;
+            daemon::run(cfg, verbose).await?;
         }
     }
 

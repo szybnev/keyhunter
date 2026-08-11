@@ -20,6 +20,7 @@ use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::github::{GitHubClient, SearchItem};
+use crate::gitlab::GitLabClient;
 use crate::patterns::{self, PATTERNS};
 
 /// Global flag for tracking Ctrl+C interruption.
@@ -34,6 +35,9 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 /// repository information, file location, and optional verification status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyFinding {
+    /// Source forge where this occurrence was found.
+    #[serde(default = "default_source")]
+    pub source: String,
     /// Provider name (e.g., "openai", "anthropic", "stripe_live")
     pub provider: String,
     /// The full API key value
@@ -60,6 +64,10 @@ pub struct KeyFinding {
     pub verified: Option<bool>,
 }
 
+fn default_source() -> String {
+    "github".to_string()
+}
+
 /// Main scanner that searches GitHub for leaked API keys.
 ///
 /// The scanner uses the GitHub Code Search API to find potential key leaks,
@@ -70,6 +78,7 @@ pub struct Scanner {
     config: Config,
     /// GitHub API client for making requests
     client: GitHubClient,
+    gitlab: Option<GitLabClient>,
     /// Thread-safe collection of discovered keys
     findings: Arc<Mutex<Vec<KeyFinding>>>,
     /// Set of seen keys for deduplication
@@ -92,15 +101,82 @@ impl Scanner {
             config.github.tokens.clone(),
             config.github.concurrency,
             config.github.delay_ms,
+            config
+                .daemon
+                .github_requests_per_hour
+                .saturating_mul(config.github.tokens.len()),
         )?;
+        let gitlab = match &config.gitlab {
+            Some(cfg) if !cfg.tokens.is_empty() => Some(GitLabClient::new(
+                &cfg.tokens[0],
+                cfg.concurrency,
+                cfg.delay_ms,
+                cfg.requests_per_hour.saturating_mul(cfg.tokens.len()),
+            )?),
+            _ => None,
+        };
 
         Ok(Self {
             config,
             client,
+            gitlab,
             findings: Arc::new(Mutex::new(Vec::new())),
             seen_keys: Arc::new(Mutex::new(HashSet::new())),
             verbose,
         })
+    }
+
+    /// Scans GitHub and, when configured, GitLab.com for one provider.
+    /// This entry point is used by the autonomous scheduler to keep each run bounded.
+    pub async fn scan_sources(
+        &self,
+        provider: &str,
+        output_format: &str,
+        skip_output: bool,
+    ) -> Result<Vec<KeyFinding>> {
+        let mut findings = self.scan_all(provider, output_format, true).await?;
+        if let Some(client) = &self.gitlab {
+            if let Err(error) = client.check_code_search().await {
+                eprintln!("GitLab source skipped: {error}");
+            } else if let Some(pattern) = PATTERNS.get(provider) {
+                for term in &pattern.search_terms {
+                    for query in [term.to_string(), format!("{term} path:.env")] {
+                        let max_pages = (self.config.scan.max_results as u32 / 20).clamp(1, 10);
+                        for page in 1..=max_pages {
+                            let items = match client.search_code(&query, page, 20).await {
+                                Ok(items) => items,
+                                Err(error) => {
+                                    eprintln!("GitLab query skipped: {error}");
+                                    break;
+                                }
+                            };
+                            if items.is_empty() {
+                                break;
+                            }
+                            for item in items {
+                                for (prov, key, masked) in
+                                    patterns::extract_keys(&item.data, Some(provider))
+                                {
+                                    findings.push(KeyFinding {
+                                        source: "gitlab".to_string(), provider: prov, key, key_masked: masked,
+                                        file_path: item.path.clone(),
+                                        file_url: format!("https://gitlab.com/api/v4/projects/{}/repository/files/{}?ref={}", item.project_id, urlencoding::encode(&item.path), item.ref_.as_deref().unwrap_or("HEAD")),
+                                        repo_name: format!("project:{}", item.project_id), repo_url: format!("https://gitlab.com/projects/{}", item.project_id),
+                                        owner: String::new(), owner_url: String::new(), owner_type: "Unknown".to_string(), found_at: Utc::now().to_rfc3339(), verified: None,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        findings.sort_by(|a, b| a.key.cmp(&b.key));
+        findings.dedup_by(|a, b| a.key == b.key);
+        if !skip_output {
+            self.output_results(&findings, output_format)?;
+        }
+        Ok(findings)
     }
 
     /// Sets up a Ctrl+C handler for graceful interruption.
@@ -633,6 +709,7 @@ impl Scanner {
 
         for (prov, key, masked) in extracted {
             findings.push(KeyFinding {
+                source: "github".to_string(),
                 provider: prov,
                 key: key.clone(),
                 key_masked: masked,

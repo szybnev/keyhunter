@@ -184,6 +184,17 @@ docker run -v $(pwd)/config.toml:/app/config.toml \
 
 Full Docker documentation for those without Rust installed.
 
+### Autonomous mode
+
+`docker compose up -d` starts the persistent scheduler. It scans one enabled
+provider immediately and then once per configured interval (60 minutes by
+default), rotating providers between runs. The named `keyhunter-data` volume
+contains the SQLite state, deduplicated findings, locations, verification
+status, and the 90-day retention history. It contains raw keys: protect the
+Docker host and do not export the volume. GitLab.com scanning is enabled only
+when `[gitlab]` has an `api`-scope token; Gitee is not supported because it has
+no supported public code-search API.
+
 ### Build & Run
 
 ```bash
@@ -272,6 +283,7 @@ keyhunter <COMMAND>
 COMMANDS:
     scan        Scan GitHub for leaked API keys
     verify      Verify if found keys are active
+    daemon      Run autonomous scheduled scans with persistent storage
     patterns    Show all supported providers and patterns
     help        Show help for a command
 ```
@@ -722,6 +734,13 @@ tokens = [
 concurrency = 5      # parallel requests
 delay_ms = 500       # delay between requests
 
+[gitlab]
+# Optional: GitLab.com personal access token with `api` scope
+tokens = ["glpat_YOUR_TOKEN"]
+concurrency = 3
+delay_ms = 1000
+requests_per_hour = 480
+
 [scan]
 max_results = 1000   # max results per query
 
@@ -730,12 +749,45 @@ format = "table"     # table, json, csv (CLI -o overrides)
 save_to_file = true
 output_path = "results"
 
+[storage]
+database_path = "results/keyhunter.sqlite3"
+retention_days = 90
+
+[daemon]
+interval_minutes = 60
+github_requests_per_hour = 480
+verify_new = true
+
 [providers]
 openai = true
 anthropic = true
 aws = true
 # ... see config.toml.example for all options
 ```
+
+### GitLab.com scanning
+
+With a valid GitLab personal access token in `[gitlab]`, `scan` searches both
+GitHub and GitLab.com. GitLab code search availability is checked before a
+scan; an unavailable source is skipped without discarding GitHub results.
+
+Gitee is intentionally not scanned: its public REST API does not expose a
+supported code-search endpoint, and KeyHunter does not scrape undocumented web
+interfaces.
+
+### Persistent autonomous scans
+
+Run `keyhunter daemon -c config.toml`, or use `docker compose up -d`. The
+daemon performs a scan at startup and then at `interval_minutes` intervals. It
+rotates one enabled provider per run and persists the next position, preventing
+an hourly run from exhausting the code-search budget.
+
+The default budget is 480 requests per token per hour. Requests are counted in
+the client and stop safely when the run budget is exhausted; API rate-limit
+responses also stop the affected source for that run. Only newly discovered
+keys are verified automatically. SQLite stores the full key values, hashes for
+deduplication, source locations, verification state, and run history; records
+unseen for `retention_days` are removed. Keep the `results` volume private.
 
 ### Results Volume
 
@@ -809,7 +861,10 @@ keyhunter/
 │   ├── config.rs        # Config parser
 │   ├── patterns.rs      # 45+ provider patterns
 │   ├── github.rs        # GitHub API client
+│   ├── gitlab.rs        # GitLab.com code-search client
 │   ├── scanner.rs       # Core scanner
+│   ├── storage.rs        # SQLite persistence and retention
+│   ├── daemon.rs         # Autonomous scheduler
 │   └── verifier.rs      # Key verification (20+ providers)
 └── tests/
     ├── config_test.rs   # Configuration tests

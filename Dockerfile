@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy source code
-COPY Cargo.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
 # Build release binary
@@ -31,7 +31,7 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /app/target/release/keyhunter /usr/local/bin/keyhunter
 
 # Create results directory
-RUN mkdir -p /app/results
+RUN mkdir -p /app/results && chmod 700 /app/results
 
 # Copy example config
 COPY config.toml.example /app/config.toml.example

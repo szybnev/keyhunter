@@ -21,6 +21,16 @@ tokens = [
 concurrency = 5
 delay_ms = 500
 
+# 480 requests/hour/token = 8 Code Search requests/minute. Autonomous mode
+# scans one provider per run, preserving a margin below platform limits.
+[gitlab]
+# GitLab.com personal access token with `api` scope. Omit this whole section
+# to scan GitHub only.
+tokens = [] # Set a real token to enable GitLab.com scanning.
+concurrency = 3
+delay_ms = 1000
+requests_per_hour = 480
+
 [scan]
 # ┌─────────────────────────────────────────────────────────────────┐
 # │ RESULTS VOLUME                                                  │
@@ -39,6 +49,16 @@ max_results = 100
 format = "table"
 save_to_file = true
 output_path = "results"
+
+[storage]
+# This database contains raw findings. Store it only in the protected Docker volume.
+database_path = "results/keyhunter.sqlite3"
+retention_days = 90
+
+[daemon]
+interval_minutes = 60
+github_requests_per_hour = 480
+verify_new = true
 
 # ╔═══════════════════════════════════════════════════════════════════╗
 # ║  PROVIDERS - Enable/disable what to scan                         ║
