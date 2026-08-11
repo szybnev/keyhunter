@@ -2,7 +2,8 @@
 
 use anyhow::Result;
 use chrono::{Duration, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::Path;
@@ -12,6 +13,31 @@ use crate::verifier::VerifiedKey;
 
 pub struct Store {
     conn: Connection,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredOccurrence {
+    pub source: String,
+    pub repo_name: String,
+    pub repo_url: String,
+    pub file_path: String,
+    pub file_url: String,
+    pub owner: String,
+    pub first_seen: String,
+    pub last_seen: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredFinding {
+    pub provider: String,
+    pub key: String,
+    pub key_masked: String,
+    pub first_seen: String,
+    pub last_seen: String,
+    pub verified: Option<bool>,
+    pub verified_at: Option<String>,
+    pub verification_error: Option<String>,
+    pub locations: Vec<StoredOccurrence>,
 }
 
 impl Store {
@@ -42,6 +68,70 @@ impl Store {
              CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
         )?;
         Ok(Self { conn })
+    }
+
+    /// Opens an existing database without creating files or applying migrations.
+    pub fn open_readonly(path: &str) -> Result<Self> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        Ok(Self { conn })
+    }
+
+    /// Lists persisted findings and their source locations without modifying storage.
+    pub fn list_findings(&self, status: &str) -> Result<Vec<StoredFinding>> {
+        let predicate = match status {
+            "active" => "verified = 1",
+            "inactive" => "verified = 0",
+            "unverified" => "verified IS NULL",
+            "all" => "1 = 1",
+            _ => {
+                anyhow::bail!("Invalid status '{status}'. Use active, inactive, unverified, or all")
+            }
+        };
+        let sql = format!(
+            "SELECT id, provider, key_full, key_masked, first_seen, last_seen, verified, verified_at, verification_error \
+             FROM findings WHERE {predicate} ORDER BY last_seen DESC, id DESC"
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                StoredFinding {
+                    provider: row.get(1)?,
+                    key: row.get(2)?,
+                    key_masked: row.get(3)?,
+                    first_seen: row.get(4)?,
+                    last_seen: row.get(5)?,
+                    verified: row.get::<_, Option<i64>>(6)?.map(|value| value != 0),
+                    verified_at: row.get(7)?,
+                    verification_error: row.get(8)?,
+                    locations: Vec::new(),
+                },
+            ))
+        })?;
+        let mut findings = Vec::new();
+        for row in rows {
+            let (id, mut finding) = row?;
+            let mut locations = self.conn.prepare(
+                "SELECT source, repo_name, repo_url, file_path, file_url, owner, first_seen, last_seen \
+                 FROM occurrences WHERE finding_id = ?1 ORDER BY last_seen DESC, id DESC",
+            )?;
+            finding.locations = locations
+                .query_map([id], |row| {
+                    Ok(StoredOccurrence {
+                        source: row.get(0)?,
+                        repo_name: row.get(1)?,
+                        repo_url: row.get(2)?,
+                        file_path: row.get(3)?,
+                        file_url: row.get(4)?,
+                        owner: row.get(5)?,
+                        first_seen: row.get(6)?,
+                        last_seen: row.get(7)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            findings.push(finding);
+        }
+        Ok(findings)
     }
 
     pub fn start_run(&self, provider: &str) -> Result<i64> {
@@ -128,5 +218,56 @@ impl Store {
             [&cutoff],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scanner::KeyFinding;
+
+    fn finding(key: &str, path: &str) -> KeyFinding {
+        KeyFinding {
+            source: "github".to_string(),
+            provider: "openai".to_string(),
+            key: key.to_string(),
+            key_masked: "sk-...test".to_string(),
+            file_path: path.to_string(),
+            file_url: format!("https://example.test/{path}"),
+            repo_name: "owner/repo".to_string(),
+            repo_url: "https://example.test/owner/repo".to_string(),
+            owner: "owner".to_string(),
+            owner_url: "https://example.test/owner".to_string(),
+            owner_type: "User".to_string(),
+            found_at: Utc::now().to_rfc3339(),
+            verified: None,
+        }
+    }
+
+    #[test]
+    fn list_findings_filters_status_and_groups_locations() {
+        let path =
+            std::env::temp_dir().join(format!("keyhunter-store-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        let first = finding("sk-test-key", ".env");
+        let second = finding("sk-test-key", "config.toml");
+        store.upsert_findings(&[first.clone(), second]).unwrap();
+        let verified = VerifiedKey {
+            finding: first,
+            is_active: true,
+            verified_at: Utc::now().to_rfc3339(),
+            verification_method: "test".to_string(),
+            error_message: None,
+        };
+        store.save_verifications(&[verified]).unwrap();
+
+        let active = store.list_findings("active").unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].locations.len(), 2);
+        assert!(store.list_findings("inactive").unwrap().is_empty());
+        assert!(store.list_findings("unverified").unwrap().is_empty());
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 }

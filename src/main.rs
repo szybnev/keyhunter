@@ -23,6 +23,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::*;
 use comfy_table::{modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL, Cell, Color, Table};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 mod config;
@@ -36,6 +39,7 @@ mod verifier;
 
 use config::Config;
 use scanner::Scanner;
+use storage::{Store, StoredFinding};
 use verifier::Verifier;
 
 /// Command-line interface structure for KeyHunter.
@@ -124,6 +128,22 @@ enum Commands {
         /// Show detailed progress while a scheduled scan is running
         #[arg(short, long)]
         verbose: bool,
+    },
+
+    /// Export persisted findings from the autonomous scanner database.
+    Findings {
+        /// Config file path
+        #[arg(short, long, default_value = "config.toml")]
+        config: PathBuf,
+        /// Verification state: active, inactive, unverified, or all
+        #[arg(short, long, default_value = "active")]
+        status: String,
+        /// Output format: table or json
+        #[arg(short, long, default_value = "table")]
+        format: String,
+        /// Write output to a new file with mode 600 instead of stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
     },
 
     /// Show supported providers and patterns
@@ -219,9 +239,63 @@ async fn main() -> Result<()> {
             let cfg = Config::load(&config).context("Failed to load config file")?;
             daemon::run(cfg, verbose).await?;
         }
+        Commands::Findings {
+            config,
+            status,
+            format,
+            output,
+        } => {
+            let cfg = Config::load(&config).context("Failed to load config file")?;
+            let findings = Store::open_readonly(&cfg.storage.database_path)
+                .context("Failed to open findings database")?
+                .list_findings(&status)?;
+            let rendered = render_findings(&findings, &format)?;
+            if let Some(path) = output {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .with_context(|| {
+                        format!("Refusing to overwrite output file: {}", path.display())
+                    })?;
+                file.write_all(rendered.as_bytes())?;
+                println!("Saved {} finding(s) to {}", findings.len(), path.display());
+            } else {
+                print!("{rendered}");
+            }
+        }
     }
 
     Ok(())
+}
+
+fn render_findings(findings: &[StoredFinding], format: &str) -> Result<String> {
+    match format {
+        "json" => Ok(format!("{}\n", serde_json::to_string_pretty(findings)?)),
+        "table" => {
+            let mut table = Table::new();
+            table
+                .load_preset(UTF8_FULL)
+                .apply_modifier(UTF8_ROUND_CORNERS)
+                .set_header(vec![
+                    Cell::new("Provider").fg(Color::Cyan),
+                    Cell::new("Key").fg(Color::Red),
+                    Cell::new("Locations").fg(Color::Cyan),
+                    Cell::new("Last seen").fg(Color::Cyan),
+                ]);
+            for finding in findings {
+                table.add_row(vec![
+                    Cell::new(&finding.provider).fg(Color::Magenta),
+                    Cell::new(&finding.key).fg(Color::Red),
+                    Cell::new(finding.locations.len()),
+                    Cell::new(&finding.last_seen),
+                ]);
+            }
+            Ok(format!("{table}\n"))
+        }
+        _ => anyhow::bail!("Invalid format '{format}'. Use table or json"),
+    }
 }
 
 /// Prints the ASCII art banner and application title.

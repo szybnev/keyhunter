@@ -192,7 +192,7 @@ default), rotating providers between runs. The named `keyhunter-data` volume
 contains the SQLite state, deduplicated findings, locations, verification
 status, and the 90-day retention history. It contains raw keys: protect the
 Docker host and do not export the volume. GitLab.com scanning is enabled only
-when `[gitlab]` has an `api`-scope token; Gitee is not supported because it has
+when `[gitlab]` has a `read_api`-scope token; Gitee is not supported because it has
 no supported public code-search API.
 
 ### Build & Run
@@ -284,6 +284,7 @@ COMMANDS:
     scan        Scan GitHub for leaked API keys
     verify      Verify if found keys are active
     daemon      Run autonomous scheduled scans with persistent storage
+    findings    Export persisted findings from the SQLite database
     patterns    Show all supported providers and patterns
     help        Show help for a command
 ```
@@ -735,7 +736,7 @@ concurrency = 5      # parallel requests
 delay_ms = 500       # delay between requests
 
 [gitlab]
-# Optional: GitLab.com personal access token with `api` scope
+# Optional: GitLab.com personal access token with `read_api` scope
 tokens = ["glpat_YOUR_TOKEN"]
 concurrency = 3
 delay_ms = 1000
@@ -767,7 +768,7 @@ aws = true
 
 ### GitLab.com scanning
 
-With a valid GitLab personal access token in `[gitlab]`, `scan` searches both
+With a valid GitLab personal access token with `read_api` scope in `[gitlab]`, `scan` searches both
 GitHub and GitLab.com. GitLab code search availability is checked before a
 scan; an unavailable source is skipped without discarding GitHub results.
 
@@ -788,6 +789,27 @@ responses also stop the affected source for that run. Only newly discovered
 keys are verified automatically. SQLite stores the full key values, hashes for
 deduplication, source locations, verification state, and run history; records
 unseen for `retention_days` are removed. Keep the `results` volume private.
+
+### Export verified findings
+
+The daemon stores verification status in SQLite. Export active findings with:
+
+```bash
+# Prints active findings, including the full key, to the current terminal
+keyhunter findings --config config.toml
+
+# Machine-readable export with all source locations
+keyhunter findings --status active --format json
+
+# Create a new protected export file (fails if the path already exists)
+keyhunter findings --format json --output /secure/path/active-keys.json
+```
+
+`findings` defaults to `--status active`; `inactive`, `unverified`, and `all`
+are also available. Full keys are intentionally included by user choice. Do not
+run this command in CI, paste output into issue trackers, or redirect it to an
+unprotected file. In JSON, the raw value is in `key`, while the repository and
+source-file links are in `locations[].repo_url` and `locations[].file_url`.
 
 ### Results Volume
 
