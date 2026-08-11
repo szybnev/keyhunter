@@ -30,9 +30,39 @@ pub struct Config {
     /// Settings for the autonomous Docker daemon.
     #[serde(default)]
     pub daemon: DaemonConfig,
+    /// Conservative, opt-in verification of persisted AI-provider findings.
+    #[serde(default)]
+    pub recheck: RecheckConfig,
     /// Per-provider enable/disable toggles
     #[serde(default)]
     pub providers: ProvidersConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RecheckConfig {
+    /// Allows the daemon to recheck persisted findings. Disabled by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Explicit acknowledgement that external verification is authorized.
+    #[serde(default)]
+    pub authorization_confirmed: bool,
+    /// Minimum delay between requests to one AI provider.
+    #[serde(default = "default_recheck_delay_ms")]
+    pub per_provider_delay_ms: u64,
+    /// Maximum persisted findings processed by one daemon cycle.
+    #[serde(default = "default_recheck_batch_size")]
+    pub batch_size: usize,
+}
+
+impl Default for RecheckConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            authorization_confirmed: false,
+            per_provider_delay_ms: default_recheck_delay_ms(),
+            batch_size: default_recheck_batch_size(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -346,6 +376,12 @@ fn default_github_budget() -> usize {
 }
 fn default_gitlab_budget() -> usize {
     480
+}
+fn default_recheck_delay_ms() -> u64 {
+    60_000
+}
+fn default_recheck_batch_size() -> usize {
+    10
 }
 
 /// Default output directory ("results")

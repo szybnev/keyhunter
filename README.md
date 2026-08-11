@@ -759,6 +759,13 @@ interval_minutes = 60
 github_requests_per_hour = 480
 verify_new = true
 
+[recheck]
+# External API calls are disabled until authorization is explicitly confirmed.
+enabled = false
+authorization_confirmed = false
+per_provider_delay_ms = 60000
+batch_size = 10
+
 [providers]
 openai = true
 anthropic = true
@@ -786,27 +793,51 @@ an hourly run from exhausting the code-search budget.
 The default budget is 480 requests per token per hour. Requests are counted in
 the client and stop safely when the run budget is exhausted; API rate-limit
 responses also stop the affected source for that run. Only newly discovered
-keys are verified automatically. SQLite stores the full key values, hashes for
+AI/LLM keys are verified automatically; other provider types are never sent to
+external verification endpoints. SQLite stores the full key values, hashes for
 deduplication, source locations, verification state, and run history; records
 unseen for `retention_days` are removed. Keep the `results` volume private.
+
+### Evidence-based verification and rechecks
+
+`valid` means the provider returned a successful verification response at least
+once. `invalid` is recorded only for an unambiguous authentication rejection.
+Rate limits, timeouts, 5xx responses and unsupported checks are exported as
+`error`, never as `invalid`. A previously valid key retains its historical
+`valid` marker even if a later check is rejected.
+
+Automated rechecks are opt-in and limited to AI/LLM providers. Set both
+`[recheck].enabled = true` and `authorization_confirmed = true` only where the
+external checks are authorized. The default is one request per provider per
+minute; 429 and retryable failures defer the finding for one hour.
+
+Run a manual, throttled batch:
+
+```bash
+# Recheck up to 100 historically confirmed AI keys
+keyhunter recheck --recheck valid --count 100 --config config.toml
+
+# Recheck all due AI findings, starting with the least recently checked
+keyhunter recheck --recheck all --count all --config config.toml
+```
 
 ### Export verified findings
 
 The daemon stores verification status in SQLite. Export active findings with:
 
 ```bash
-# Prints active findings, including the full key, to the current terminal
+# Prints historically valid findings, including the full key, to the current terminal
 keyhunter findings --config config.toml
 
 # Machine-readable export with all source locations
-keyhunter findings --status active --format json
+keyhunter findings --status valid --format json
 
 # Create a new protected export file (fails if the path already exists)
 keyhunter findings --format json --output /secure/path/active-keys.json
 ```
 
-`findings` defaults to `--status active`; `inactive`, `unverified`, and `all`
-are also available. Full keys are intentionally included by user choice. Do not
+`findings` defaults to `--status active` (an alias for historical `valid`);
+`invalid`, `error`, `unverified`, and `all` are also available. Full keys are intentionally included by user choice. Do not
 run this command in CI, paste output into issue trackers, or redirect it to an
 unprotected file. In JSON, the raw value is in `key`, while the repository and
 source-file links are in `locations[].repo_url` and `locations[].file_url`.

@@ -60,6 +60,15 @@ interval_minutes = 60
 github_requests_per_hour = 480
 verify_new = true
 
+# Verification is restricted to AI/LLM providers.  It is deliberately off
+# until you confirm that the external verification calls are authorized.
+[recheck]
+enabled = false
+authorization_confirmed = false
+# One request per provider per minute; lower this only with provider approval.
+per_provider_delay_ms = 60000
+batch_size = 10
+
 # ╔═══════════════════════════════════════════════════════════════════╗
 # ║  PROVIDERS - Enable/disable what to scan                         ║
 # ╚═══════════════════════════════════════════════════════════════════╝

@@ -48,6 +48,13 @@ behavioral change, list verification commands and results, link related issues
 when applicable, and include CLI output or screenshots when user-visible
 output changes. Never commit `config.toml`, scan results, or exposed secrets.
 
+After every completed codebase update, run the relevant verification, then
+create and push a scoped commit to the current upstream branch. Before staging,
+inspect `git status` and include only files changed for that update; never
+commit unrelated work, local configuration, results, or secrets. If pushing is
+blocked by authentication, branch protection, conflicts, or an uncertain
+target, stop and report the exact blocker instead of force-pushing.
+
 ## Security & Configuration
 
 Use only authorized, public test targets when exercising scans or verification.

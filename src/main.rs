@@ -135,7 +135,7 @@ enum Commands {
         /// Config file path
         #[arg(short, long, default_value = "config.toml")]
         config: PathBuf,
-        /// Verification state: active, inactive, unverified, or all
+        /// Verification state: valid, invalid, error, unverified, or all
         #[arg(short, long, default_value = "active")]
         status: String,
         /// Output format: table or json
@@ -144,6 +144,19 @@ enum Commands {
         /// Write output to a new file with mode 600 instead of stdout
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+
+    /// Recheck persisted AI/LLM findings with conservative throttling.
+    Recheck {
+        /// Config file path
+        #[arg(short, long, default_value = "config.toml")]
+        config: PathBuf,
+        /// Select historically valid, currently invalid, or all AI findings
+        #[arg(long, value_parser = ["valid", "invalid", "all"])]
+        recheck: String,
+        /// Number of findings: 1..100000, or `all`
+        #[arg(long, default_value = "100")]
+        count: String,
     },
 
     /// Show supported providers and patterns
@@ -265,9 +278,59 @@ async fn main() -> Result<()> {
                 print!("{rendered}");
             }
         }
+        Commands::Recheck {
+            config,
+            recheck,
+            count,
+        } => {
+            let cfg = Config::load(&config).context("Failed to load config file")?;
+            if !cfg.recheck.authorization_confirmed {
+                anyhow::bail!("Refusing external verification: set [recheck].authorization_confirmed = true after confirming authorization");
+            }
+            let count = parse_recheck_count(&count)?;
+            let store = Store::open(&cfg.storage.database_path)
+                .context("Failed to open findings database")?;
+            let findings = store.findings_for_recheck(&recheck, count)?;
+            if findings.is_empty() {
+                println!("No due AI/LLM findings match --recheck {recheck}.");
+                return Ok(());
+            }
+            let verifier = Verifier::new(1)?;
+            let verified = verifier
+                .verify_ai_throttled(
+                    findings,
+                    std::time::Duration::from_millis(cfg.recheck.per_provider_delay_ms),
+                )
+                .await;
+            store.save_verifications(&verified)?;
+            let valid = verified
+                .iter()
+                .filter(|item| item.outcome == verifier::VerificationOutcome::Valid)
+                .count();
+            let invalid = verified
+                .iter()
+                .filter(|item| item.outcome == verifier::VerificationOutcome::Invalid)
+                .count();
+            println!(
+                "Rechecked {} AI/LLM finding(s): valid={valid}, invalid={invalid}, other={}",
+                verified.len(),
+                verified.len() - valid - invalid
+            );
+        }
     }
 
     Ok(())
+}
+
+fn parse_recheck_count(value: &str) -> Result<usize> {
+    if value == "all" {
+        return Ok(1_000_000_000);
+    }
+    let count: usize = value.parse().context("--count must be 1..100000 or all")?;
+    if !(1..=100_000).contains(&count) {
+        anyhow::bail!("--count must be 1..100000 or all");
+    }
+    Ok(count)
 }
 
 fn render_findings(findings: &[StoredFinding], format: &str) -> Result<String> {
@@ -283,6 +346,7 @@ fn render_findings(findings: &[StoredFinding], format: &str) -> Result<String> {
                     Cell::new("Key").fg(Color::Red),
                     Cell::new("Locations").fg(Color::Cyan),
                     Cell::new("Last seen").fg(Color::Cyan),
+                    Cell::new("Status").fg(Color::Cyan),
                 ]);
             for finding in findings {
                 table.add_row(vec![
@@ -290,6 +354,7 @@ fn render_findings(findings: &[StoredFinding], format: &str) -> Result<String> {
                     Cell::new(&finding.key).fg(Color::Red),
                     Cell::new(finding.locations.len()),
                     Cell::new(&finding.last_seen),
+                    Cell::new(&finding.latest_status),
                 ]);
             }
             Ok(format!("{table}\n"))

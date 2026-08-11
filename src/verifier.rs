@@ -30,12 +30,67 @@ pub struct VerifiedKey {
     pub finding: KeyFinding,
     /// Whether the key is active and working
     pub is_active: bool,
+    /// Evidence-based result. `valid` is recorded only after a successful
+    /// provider response; transient failures are deliberately not `invalid`.
+    pub outcome: VerificationOutcome,
     /// ISO 8601 timestamp when verification was performed
     pub verified_at: String,
     /// API endpoint or method used for verification
     pub verification_method: String,
     /// Error message if verification failed (rate limit, timeout, etc.)
     pub error_message: Option<String>,
+}
+
+/// Result of one verification attempt.  This is intentionally richer than a
+/// boolean: a timeout or a provider rate limit cannot prove a key is invalid.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationOutcome {
+    Valid,
+    Invalid,
+    RetryableError,
+    Indeterminate,
+    Unsupported,
+}
+
+impl VerificationOutcome {
+    fn from_legacy(is_active: bool, error: &Option<String>, method: &str) -> Self {
+        if is_active {
+            return Self::Valid;
+        }
+        if method == "unsupported"
+            || method.starts_with("requires ")
+            || method == "DSN format"
+            || error.as_deref().is_some_and(|message| {
+                message.contains("not implemented") || message.contains("requires ")
+            })
+        {
+            return Self::Unsupported;
+        }
+        match error.as_deref() {
+            None => Self::Invalid,
+            Some(message)
+                if message.contains("rate limited")
+                    || message.contains("429")
+                    || message.contains("timeout")
+                    || message.contains("connection")
+                    || message.contains("temporar") =>
+            {
+                Self::RetryableError
+            }
+            Some(_) => Self::Indeterminate,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Valid => "valid",
+            Self::Invalid => "invalid",
+            Self::RetryableError => "retryable_error",
+            Self::Indeterminate => "indeterminate",
+            Self::Unsupported => "unsupported",
+        }
+    }
 }
 
 /// API key verifier that tests keys against provider endpoints.
@@ -51,6 +106,39 @@ pub struct Verifier {
 }
 
 impl Verifier {
+    /// Only these providers may be contacted by automated verification.
+    pub fn is_ai_provider(provider: &str) -> bool {
+        matches!(
+            provider.to_lowercase().as_str(),
+            "openai"
+                | "anthropic"
+                | "google"
+                | "groq"
+                | "perplexity"
+                | "huggingface"
+                | "replicate"
+                | "fireworks"
+                | "cohere"
+                | "mistral"
+                | "together"
+                | "deepseek"
+        )
+    }
+
+    fn unsupported_finding(mut finding: KeyFinding) -> VerifiedKey {
+        finding.verified = None;
+        VerifiedKey {
+            finding,
+            is_active: false,
+            outcome: VerificationOutcome::Unsupported,
+            verified_at: Utc::now().to_rfc3339(),
+            verification_method: "not authorized for automatic verification".to_string(),
+            error_message: Some(
+                "Only AI/LLM providers are authorized for verification".to_string(),
+            ),
+        }
+    }
+
     /// Creates a new Verifier instance.
     ///
     /// # Arguments
@@ -64,23 +152,34 @@ impl Verifier {
         Ok(Self { client, concurrent })
     }
 
-    /// Verifies every supplied finding and returns both active and inactive results.
-    /// Autonomous mode persists these statuses instead of emitting secret-bearing output.
-    pub async fn verify_all(&self, findings: Vec<KeyFinding>) -> Vec<VerifiedKey> {
-        let mut verified = Vec::new();
-        for chunk in findings.chunks(self.concurrent) {
-            let tasks: Vec<_> = chunk
-                .iter()
-                .map(|finding| {
-                    let client = self.client.clone();
-                    let finding = finding.clone();
-                    async move { Self::verify_single(&client, finding).await }
-                })
-                .collect();
-            verified.extend(join_all(tasks).await.into_iter().filter_map(Result::ok));
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    /// Verifies AI findings sequentially with a provider-aware minimum delay.
+    /// This deliberately trades speed for predictable, non-bursty API use.
+    pub async fn verify_ai_throttled(
+        &self,
+        findings: Vec<KeyFinding>,
+        per_provider_delay: Duration,
+    ) -> Vec<VerifiedKey> {
+        let mut results = Vec::with_capacity(findings.len());
+        let mut last_request: HashMap<String, tokio::time::Instant> = HashMap::new();
+        for finding in findings {
+            if !Self::is_ai_provider(&finding.provider) {
+                results.push(Self::unsupported_finding(finding));
+                continue;
+            }
+            let provider = finding.provider.to_lowercase();
+            if let Some(previous) = last_request.get(&provider) {
+                let elapsed = previous.elapsed();
+                if elapsed < per_provider_delay {
+                    tokio::time::sleep(per_provider_delay - elapsed).await;
+                }
+            }
+            let result = Self::verify_single(&self.client, finding).await;
+            last_request.insert(provider, tokio::time::Instant::now());
+            if let Ok(result) = result {
+                results.push(result);
+            }
         }
-        verified
+        results
     }
 
     /// Verifies keys loaded from a JSON file.
@@ -123,6 +222,16 @@ impl Verifier {
         } else {
             findings
         };
+
+        let skipped = filtered.len();
+        filtered.retain(|finding| Self::is_ai_provider(&finding.provider));
+        if skipped != filtered.len() {
+            println!(
+                "{} Skipped {} non-AI finding(s): external verification is not authorized for them",
+                "⚠".yellow(),
+                skipped - filtered.len()
+            );
+        }
 
         if filtered.is_empty() {
             println!("{} No keys to verify", "⚠".yellow());
@@ -310,7 +419,10 @@ impl Verifier {
         }
 
         // Apply limit
-        let mut to_verify = findings;
+        let mut to_verify: Vec<_> = findings
+            .into_iter()
+            .filter(|finding| Self::is_ai_provider(&finding.provider))
+            .collect();
         if let Some(lim) = limit {
             to_verify.truncate(lim);
         }
@@ -565,13 +677,22 @@ impl Verifier {
             ),
         };
 
+        let outcome = VerificationOutcome::from_legacy(is_active, &error, &method);
+
         // Update the finding's verified field
         let mut updated_finding = finding;
-        updated_finding.verified = Some(is_active);
+        // Keep the old field compatible, but never turn a transport/provider
+        // failure into a false verification result.
+        updated_finding.verified = match outcome {
+            VerificationOutcome::Valid => Some(true),
+            VerificationOutcome::Invalid => Some(false),
+            _ => None,
+        };
 
         Ok(VerifiedKey {
             finding: updated_finding,
             is_active,
+            outcome,
             verified_at: Utc::now().to_rfc3339(),
             verification_method: method,
             error_message: error,
@@ -638,8 +759,12 @@ impl Verifier {
                         if body.contains("invalid_api_key") || body.contains("authentication") {
                             (false, "POST /v1/messages".to_string(), None)
                         } else {
-                            // Bad request but key might be valid
-                            (true, "POST /v1/messages".to_string(), None)
+                            // A malformed request cannot prove the key works.
+                            (
+                                false,
+                                "POST /v1/messages".to_string(),
+                                Some("status 400".to_string()),
+                            )
                         }
                     }
                     429 => (
@@ -671,7 +796,10 @@ impl Verifier {
                 let status = r.status().as_u16();
                 match status {
                     200 => (true, "GET /v1/models".to_string(), None),
-                    400 | 401 | 403 => (false, "GET /v1/models".to_string(), None),
+                    // 400/403 can mean API configuration or policy, not an
+                    // invalid credential. Only the explicit auth rejection is
+                    // evidence for `invalid`.
+                    401 => (false, "GET /v1/models".to_string(), None),
                     429 => (
                         false,
                         "GET /v1/models".to_string(),
@@ -1321,5 +1449,34 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("...{}", &s[s.len() - max + 3..])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VerificationOutcome;
+
+    #[test]
+    fn only_explicit_auth_rejection_is_invalid() {
+        assert_eq!(
+            VerificationOutcome::from_legacy(false, &None, "GET /v1/models"),
+            VerificationOutcome::Invalid
+        );
+        assert_eq!(
+            VerificationOutcome::from_legacy(
+                false,
+                &Some("status 403".to_string()),
+                "GET /v1/models"
+            ),
+            VerificationOutcome::Indeterminate
+        );
+        assert_eq!(
+            VerificationOutcome::from_legacy(
+                false,
+                &Some("rate limited".to_string()),
+                "GET /v1/models"
+            ),
+            VerificationOutcome::RetryableError
+        );
     }
 }

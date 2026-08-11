@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::scanner::KeyFinding;
-use crate::verifier::VerifiedKey;
+use crate::verifier::{VerificationOutcome, VerifiedKey};
 
 pub struct Store {
     conn: Connection,
@@ -37,6 +37,11 @@ pub struct StoredFinding {
     pub verified: Option<bool>,
     pub verified_at: Option<String>,
     pub verification_error: Option<String>,
+    pub ever_valid: bool,
+    pub latest_status: String,
+    pub last_checked_at: Option<String>,
+    pub last_valid_at: Option<String>,
+    pub last_invalid_at: Option<String>,
     pub locations: Vec<StoredOccurrence>,
 }
 
@@ -67,7 +72,61 @@ impl Store {
              );
              CREATE TABLE IF NOT EXISTS scheduler_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);"
         )?;
-        Ok(Self { conn })
+        let store = Self { conn };
+        store.migrate_verification_state()?;
+        Ok(store)
+    }
+
+    fn has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let mut statement = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(columns.iter().any(|name| name == column))
+    }
+
+    /// Idempotent migration for databases created by earlier daemon versions.
+    fn migrate_verification_state(&self) -> Result<()> {
+        for (column, definition) in [
+            ("ever_valid", "INTEGER NOT NULL DEFAULT 0"),
+            ("latest_status", "TEXT NOT NULL DEFAULT 'unverified'"),
+            ("last_checked_at", "TEXT"),
+            ("last_valid_at", "TEXT"),
+            ("last_invalid_at", "TEXT"),
+            ("next_retry_at", "TEXT"),
+        ] {
+            if !self.has_column("findings", column)? {
+                self.conn.execute_batch(&format!(
+                    "ALTER TABLE findings ADD COLUMN {column} {definition}"
+                ))?;
+            }
+        }
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS verification_attempts (
+                id INTEGER PRIMARY KEY,
+                finding_id INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
+                checked_at TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                method TEXT NOT NULL,
+                error_message TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_findings_recheck ON findings(latest_status, last_checked_at);
+            CREATE INDEX IF NOT EXISTS idx_attempts_finding ON verification_attempts(finding_id, checked_at);",
+        )?;
+        // Earlier versions did not persist enough response evidence to prove
+        // that a false result was an authentication rejection.
+        self.conn.execute_batch(
+            "UPDATE findings SET
+                ever_valid = CASE WHEN verified = 1 THEN 1 ELSE ever_valid END,
+                latest_status = CASE
+                    WHEN verified = 1 THEN 'valid'
+                    WHEN verified = 0 THEN 'indeterminate'
+                    ELSE latest_status END,
+                last_checked_at = COALESCE(last_checked_at, verified_at),
+                last_valid_at = CASE WHEN verified = 1 THEN COALESCE(last_valid_at, verified_at) ELSE last_valid_at END,
+                last_invalid_at = last_invalid_at;",
+        )?;
+        Ok(())
     }
 
     /// Opens an existing database without creating files or applying migrations.
@@ -79,16 +138,21 @@ impl Store {
     /// Lists persisted findings and their source locations without modifying storage.
     pub fn list_findings(&self, status: &str) -> Result<Vec<StoredFinding>> {
         let predicate = match status {
-            "active" => "verified = 1",
-            "inactive" => "verified = 0",
-            "unverified" => "verified IS NULL",
+            "active" | "valid" => "ever_valid = 1",
+            "inactive" | "invalid" => "latest_status = 'invalid'",
+            "error" | "indeterminate" => {
+                "latest_status IN ('retryable_error', 'indeterminate', 'unsupported')"
+            }
+            "unverified" => "latest_status = 'unverified'",
             "all" => "1 = 1",
             _ => {
-                anyhow::bail!("Invalid status '{status}'. Use active, inactive, unverified, or all")
+                anyhow::bail!(
+                    "Invalid status '{status}'. Use valid, invalid, error, unverified, or all"
+                )
             }
         };
         let sql = format!(
-            "SELECT id, provider, key_full, key_masked, first_seen, last_seen, verified, verified_at, verification_error \
+            "SELECT id, provider, key_full, key_masked, first_seen, last_seen, verified, verified_at, verification_error, ever_valid, latest_status, last_checked_at, last_valid_at, last_invalid_at \
              FROM findings WHERE {predicate} ORDER BY last_seen DESC, id DESC"
         );
         let mut statement = self.conn.prepare(&sql)?;
@@ -104,6 +168,11 @@ impl Store {
                     verified: row.get::<_, Option<i64>>(6)?.map(|value| value != 0),
                     verified_at: row.get(7)?,
                     verification_error: row.get(8)?,
+                    ever_valid: row.get::<_, i64>(9)? != 0,
+                    latest_status: row.get(10)?,
+                    last_checked_at: row.get(11)?,
+                    last_valid_at: row.get(12)?,
+                    last_invalid_at: row.get(13)?,
                     locations: Vec::new(),
                 },
             ))
@@ -203,9 +272,86 @@ impl Store {
     pub fn save_verifications(&self, verified: &[VerifiedKey]) -> Result<()> {
         for item in verified {
             let hash = format!("{:x}", Sha256::digest(item.finding.key.as_bytes()));
-            self.conn.execute("UPDATE findings SET verified=?1,verified_at=?2,verification_error=?3 WHERE key_hash=?4", params![item.is_active as i64, item.verified_at, item.error_message, hash])?;
+            let legacy_verified: Option<i64> = match item.outcome {
+                VerificationOutcome::Valid => Some(1),
+                VerificationOutcome::Invalid => Some(0),
+                _ => None,
+            };
+            let retry_at = if item.outcome == VerificationOutcome::RetryableError {
+                Some((Utc::now() + Duration::hours(1)).to_rfc3339())
+            } else {
+                None
+            };
+            self.conn.execute(
+                "UPDATE findings SET
+                    verified=?1, verified_at=?2, verification_error=?3,
+                    ever_valid=CASE WHEN ?4 = 'valid' THEN 1 ELSE ever_valid END,
+                    latest_status=?4, last_checked_at=?2,
+                    last_valid_at=CASE WHEN ?4 = 'valid' THEN ?2 ELSE last_valid_at END,
+                    last_invalid_at=CASE WHEN ?4 = 'invalid' THEN ?2 ELSE last_invalid_at END,
+                    next_retry_at=?5
+                 WHERE key_hash=?6",
+                params![
+                    legacy_verified,
+                    item.verified_at,
+                    item.error_message,
+                    item.outcome.as_str(),
+                    retry_at,
+                    hash
+                ],
+            )?;
+            let finding_id: i64 = self.conn.query_row(
+                "SELECT id FROM findings WHERE key_hash=?1",
+                [&hash],
+                |row| row.get(0),
+            )?;
+            self.conn.execute(
+                "INSERT INTO verification_attempts(finding_id,checked_at,outcome,method,error_message) VALUES(?1,?2,?3,?4,?5)",
+                params![finding_id, item.verified_at, item.outcome.as_str(), item.verification_method, item.error_message],
+            )?;
         }
         Ok(())
+    }
+
+    /// Selects only AI/LLM findings due for verification. Other provider types
+    /// are intentionally never sent to external APIs by autonomous mode.
+    pub fn findings_for_recheck(&self, scope: &str, count: usize) -> Result<Vec<KeyFinding>> {
+        let scope_predicate = match scope {
+            "valid" => "f.ever_valid = 1",
+            "invalid" => "f.latest_status = 'invalid'",
+            "all" => "1 = 1",
+            _ => anyhow::bail!("Invalid recheck scope '{scope}'. Use valid, invalid, or all"),
+        };
+        let ai_providers = "'openai','anthropic','google','groq','perplexity','huggingface','replicate','fireworks','cohere','mistral','together','deepseek'";
+        let sql = format!(
+            "SELECT f.provider,f.key_full,f.key_masked,f.first_seen,o.source,o.file_path,o.file_url,o.repo_name,o.repo_url,o.owner \
+             FROM findings f JOIN occurrences o ON o.id=(SELECT id FROM occurrences WHERE finding_id=f.id ORDER BY last_seen DESC,id DESC LIMIT 1) \
+             WHERE {scope_predicate} AND f.provider IN ({ai_providers}) AND (f.next_retry_at IS NULL OR f.next_retry_at <= ?1) \
+             ORDER BY CASE WHEN f.last_checked_at IS NULL THEN 0 ELSE 1 END, f.last_checked_at ASC, f.id ASC LIMIT ?2"
+        );
+        let now = Utc::now().to_rfc3339();
+        self.conn
+            .prepare(&sql)?
+            .query_map(params![now, count as i64], |row| {
+                let latest: Option<bool> = None;
+                Ok(KeyFinding {
+                    provider: row.get(0)?,
+                    key: row.get(1)?,
+                    key_masked: row.get(2)?,
+                    found_at: row.get(3)?,
+                    source: row.get(4)?,
+                    file_path: row.get(5)?,
+                    file_url: row.get(6)?,
+                    repo_name: row.get(7)?,
+                    repo_url: row.get(8)?,
+                    owner: row.get(9)?,
+                    owner_url: String::new(),
+                    owner_type: String::new(),
+                    verified: latest,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
     pub fn cleanup(&self, retention_days: i64) -> Result<()> {
         let cutoff = (Utc::now() - Duration::days(retention_days)).to_rfc3339();
@@ -256,6 +402,7 @@ mod tests {
         let verified = VerifiedKey {
             finding: first,
             is_active: true,
+            outcome: VerificationOutcome::Valid,
             verified_at: Utc::now().to_rfc3339(),
             verification_method: "test".to_string(),
             error_message: None,
@@ -267,6 +414,66 @@ mod tests {
         assert_eq!(active[0].locations.len(), 2);
         assert!(store.list_findings("inactive").unwrap().is_empty());
         assert!(store.list_findings("unverified").unwrap().is_empty());
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn error_attempt_is_not_classified_as_invalid_and_non_ai_is_not_rechecked() {
+        let path = std::env::temp_dir().join(format!(
+            "keyhunter-store-outcome-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        let ai = finding("sk-ai-key", ".env");
+        let mut non_ai = finding("AKIAIOSFODNN7EXAMPLE", "aws.env");
+        non_ai.provider = "aws".to_string();
+        store.upsert_findings(&[ai.clone(), non_ai]).unwrap();
+        store
+            .save_verifications(&[VerifiedKey {
+                finding: ai,
+                is_active: false,
+                outcome: VerificationOutcome::Indeterminate,
+                verified_at: Utc::now().to_rfc3339(),
+                verification_method: "GET /v1/models".to_string(),
+                error_message: Some("unexpected provider response".to_string()),
+            }])
+            .unwrap();
+
+        assert!(store.list_findings("invalid").unwrap().is_empty());
+        assert_eq!(store.list_findings("error").unwrap().len(), 1);
+        let due = store.findings_for_recheck("all", 10).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].provider, "openai");
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn migrates_legacy_error_to_indeterminate() {
+        let path = std::env::temp_dir().join(format!(
+            "keyhunter-store-migration-{}-{}.sqlite",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE findings (
+                    id INTEGER PRIMARY KEY, key_hash TEXT NOT NULL UNIQUE, provider TEXT NOT NULL,
+                    key_full TEXT NOT NULL, key_masked TEXT NOT NULL, first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL, verified INTEGER, verified_at TEXT, verification_error TEXT
+                );
+                INSERT INTO findings(key_hash,provider,key_full,key_masked,first_seen,last_seen,verified,verified_at,verification_error)
+                VALUES('hash','openai','sk-test','sk-...test','2020-01-01','2020-01-01',0,'2020-01-01','rate limited');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let store = Store::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(store.list_findings("error").unwrap().len(), 1);
+        assert!(store.list_findings("invalid").unwrap().is_empty());
         drop(store);
         let _ = std::fs::remove_file(&path);
     }
