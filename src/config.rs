@@ -74,6 +74,9 @@ pub struct GitLabConfig {
     pub delay_ms: u64,
     #[serde(default = "default_gitlab_budget")]
     pub requests_per_hour: usize,
+    /// Public projects searched per run when GitLab.com disables global blob search.
+    #[serde(default = "default_gitlab_fallback_projects")]
+    pub fallback_projects_per_run: usize,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -376,6 +379,9 @@ fn default_github_budget() -> usize {
 }
 fn default_gitlab_budget() -> usize {
     480
+}
+fn default_gitlab_fallback_projects() -> usize {
+    50
 }
 fn default_recheck_delay_ms() -> u64 {
     60_000

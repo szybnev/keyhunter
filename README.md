@@ -741,6 +741,8 @@ tokens = ["glpat_YOUR_TOKEN"]
 concurrency = 3
 delay_ms = 1000
 requests_per_hour = 480
+# GitLab.com may disable global code search; scan this many recent public projects then.
+fallback_projects_per_run = 50
 
 [scan]
 max_results = 1000   # max results per query
@@ -776,8 +778,11 @@ aws = true
 ### GitLab.com scanning
 
 With a valid GitLab personal access token with `read_api` scope in `[gitlab]`, `scan` searches both
-GitHub and GitLab.com. GitLab code search availability is checked before a
-scan; an unavailable source is skipped without discarding GitHub results.
+GitHub and GitLab.com. GitLab.com can prohibit global `scope=blobs` search
+unless Advanced or Exact Code Search is enabled. In that case KeyHunter uses
+the documented project-local search API for the most recently active public
+projects, limited by `fallback_projects_per_run` and `requests_per_hour`.
+GitHub results are retained if either GitLab path is unavailable.
 
 Gitee is intentionally not scanned: its public REST API does not expose a
 supported code-search endpoint, and KeyHunter does not scrape undocumented web

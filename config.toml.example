@@ -24,12 +24,14 @@ delay_ms = 500
 # 480 requests/hour/token = 8 Code Search requests/minute. Autonomous mode
 # scans one provider per run, preserving a margin below platform limits.
 [gitlab]
-# GitLab.com personal access token with `api` scope. Omit this whole section
-# to scan GitHub only.
+# GitLab.com personal access token with `read_api` scope. Omit this whole section
+# to scan GitHub only. GitLab.com may forbid global blob search; in that case
+# KeyHunter searches this many recently active public projects individually.
 tokens = [] # Set a real token to enable GitLab.com scanning.
 concurrency = 3
 delay_ms = 1000
 requests_per_hour = 480
+fallback_projects_per_run = 50
 
 [scan]
 # ┌─────────────────────────────────────────────────────────────────┐

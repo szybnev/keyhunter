@@ -136,38 +136,101 @@ impl Scanner {
     ) -> Result<Vec<KeyFinding>> {
         let mut findings = self.scan_all(provider, output_format, true).await?;
         if let Some(client) = &self.gitlab {
-            if let Err(error) = client.check_code_search().await {
-                eprintln!("GitLab source skipped: {error}");
-            } else if let Some(pattern) = PATTERNS.get(provider) {
-                for term in &pattern.search_terms {
-                    for query in [term.to_string(), format!("{term} path:.env")] {
-                        let max_pages = (self.config.scan.max_results as u32 / 20).clamp(1, 10);
-                        for page in 1..=max_pages {
-                            let items = match client.search_code(&query, page, 20).await {
-                                Ok(items) => items,
-                                Err(error) => {
-                                    eprintln!("GitLab query skipped: {error}");
+            if let Some(pattern) = PATTERNS.get(provider) {
+                let global_search = match client.supports_global_code_search().await {
+                    Ok(supported) => supported,
+                    Err(error) => {
+                        eprintln!("GitLab source skipped: {error}");
+                        false
+                    }
+                };
+                if global_search {
+                    for term in &pattern.search_terms {
+                        for query in [term.to_string(), format!("{term} filename:.env")] {
+                            let max_pages = (self.config.scan.max_results as u32 / 20).clamp(1, 10);
+                            for page in 1..=max_pages {
+                                let items = match client.search_code(&query, page, 20).await {
+                                    Ok(items) => items,
+                                    Err(error) => {
+                                        eprintln!("GitLab query skipped: {error}");
+                                        break;
+                                    }
+                                };
+                                if items.is_empty() {
                                     break;
                                 }
-                            };
-                            if items.is_empty() {
-                                break;
-                            }
-                            for item in items {
-                                for (prov, key, masked) in
-                                    patterns::extract_keys(&item.data, Some(provider))
-                                {
-                                    findings.push(KeyFinding {
+                                for item in items {
+                                    for (prov, key, masked) in
+                                        patterns::extract_keys(&item.data, Some(provider))
+                                    {
+                                        findings.push(KeyFinding {
                                         source: "gitlab".to_string(), provider: prov, key, key_masked: masked,
                                         file_path: item.path.clone(),
                                         file_url: format!("https://gitlab.com/api/v4/projects/{}/repository/files/{}?ref={}", item.project_id, urlencoding::encode(&item.path), item.ref_.as_deref().unwrap_or("HEAD")),
                                         repo_name: format!("project:{}", item.project_id), repo_url: format!("https://gitlab.com/projects/{}", item.project_id),
                                         owner: String::new(), owner_url: String::new(), owner_type: "Unknown".to_string(), found_at: Utc::now().to_rfc3339(), verified: None,
                                     });
+                                    }
                                 }
                             }
                         }
                     }
+                } else if let Ok(projects) = client
+                    .list_public_projects(
+                        self.config
+                            .gitlab
+                            .as_ref()
+                            .unwrap()
+                            .fallback_projects_per_run
+                            .clamp(1, 100) as u32,
+                    )
+                    .await
+                {
+                    eprintln!("GitLab global blob search is unavailable; using project-local fallback for {} public projects", projects.len());
+                    for project in projects {
+                        for term in &pattern.search_terms {
+                            for query in [term.to_string(), format!("{term} filename:.env")] {
+                                let items = match client
+                                    .search_project_code(project.id, &query, 20)
+                                    .await
+                                {
+                                    Ok(items) => items,
+                                    Err(error) => {
+                                        eprintln!("GitLab project query skipped: {error}");
+                                        break;
+                                    }
+                                };
+                                for item in items {
+                                    for (prov, key, masked) in
+                                        patterns::extract_keys(&item.data, Some(provider))
+                                    {
+                                        findings.push(KeyFinding {
+                                            source: "gitlab".to_string(),
+                                            provider: prov,
+                                            key,
+                                            key_masked: masked,
+                                            file_path: item.path.clone(),
+                                            file_url: format!(
+                                                "{}/-/blob/{}/{}",
+                                                project.web_url,
+                                                item.ref_.as_deref().unwrap_or("HEAD"),
+                                                urlencoding::encode(&item.path)
+                                            ),
+                                            repo_name: project.path_with_namespace.clone(),
+                                            repo_url: project.web_url.clone(),
+                                            owner: project.namespace.full_path.clone(),
+                                            owner_url: String::new(),
+                                            owner_type: "Project".to_string(),
+                                            found_at: Utc::now().to_rfc3339(),
+                                            verified: None,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!("GitLab source skipped: public-project fallback unavailable");
                 }
             }
         }
