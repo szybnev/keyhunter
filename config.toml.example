@@ -123,10 +123,10 @@ discord_webhook = true
 telegram = true       # Telegram bot tokens
 
 # ── Database ─────────────────────────────────────────────────────────
-mongodb = true        # MongoDB connection strings
-postgres = true       # PostgreSQL connection strings
-mysql = true
-redis = true
+mongodb = false       # Broad connection-string pattern; enable only for an authorized target scope.
+postgres = false      # Broad connection-string pattern; enable only for an authorized target scope.
+mysql = false         # Broad connection-string pattern; enable only for an authorized target scope.
+redis = false         # Broad connection-string pattern; enable only for an authorized target scope.
 
 # ── Other Services ───────────────────────────────────────────────────
 firebase = true       # Firebase/FCM keys

@@ -998,12 +998,16 @@ pub fn extract_keys(content: &str, provider: Option<&str>) -> Vec<(String, Strin
         None => PATTERNS.iter().map(|(k, v)| (*k, v)).collect(),
     };
 
-    for (_provider_name, pattern) in patterns_to_check {
+    for (provider_name, pattern) in patterns_to_check {
         for cap in pattern.regex.find_iter(content) {
             let key = cap.as_str().to_string();
 
             // Skip placeholders and examples
             if is_placeholder(&key) {
+                continue;
+            }
+
+            if is_low_quality_candidate(provider_name, &key, content) {
                 continue;
             }
 
@@ -1013,7 +1017,9 @@ pub fn extract_keys(content: &str, provider: Option<&str>) -> Vec<(String, Strin
             }
 
             let masked = mask_key(&key);
-            results.push((pattern.name.to_string(), key, masked));
+            // Persist the stable internal ID. Display labels are not safe API
+            // identifiers and previously prevented Google/xAI verification.
+            results.push((provider_name.to_string(), key, masked));
         }
     }
 
@@ -1022,6 +1028,36 @@ pub fn extract_keys(content: &str, provider: Option<&str>) -> Vec<(String, Strin
     results.dedup_by(|a, b| a.1 == b.1);
 
     results
+}
+
+/// Rejects formats that are syntactically valid but overwhelmingly occur in
+/// documentation, local development configuration, or unrelated services.
+fn is_low_quality_candidate(provider: &str, key: &str, content: &str) -> bool {
+    let lower_key = key.to_ascii_lowercase();
+    match provider {
+        // AIza keys are shared by many Google products. Only retain ones with
+        // Gemini/Google AI evidence in the file, rather than calling them AI.
+        "google" => {
+            let lower_content = content.to_ascii_lowercase();
+            !(lower_content.contains("gemini")
+                || lower_content.contains("generativelanguage")
+                || lower_content.contains("google_ai")
+                || lower_content.contains("google ai"))
+        }
+        // Do not collect ubiquitous local/example connection strings.
+        "postgres" | "mysql" | "mongodb" | "redis" => {
+            lower_key.contains("localhost")
+                || lower_key.contains("127.0.0.1")
+                || lower_key.contains("0.0.0.0")
+                || lower_key.contains(":password@")
+                || lower_key.contains(":postgres@")
+                || lower_key.contains(":root@")
+                || lower_key.contains(":user@")
+                || lower_key.contains(":test@")
+                || lower_key.contains("example")
+        }
+        _ => false,
+    }
 }
 
 /// Checks if a key appears to be a placeholder or example.
@@ -1061,4 +1097,27 @@ fn mask_key(key: &str) -> String {
     let start = &key[..10];
     let end = &key[len - 4..];
     format!("{}...{}", start, end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_keys;
+
+    #[test]
+    fn google_key_requires_gemini_context_and_uses_canonical_id() {
+        let key = format!("AIza{}", "a".repeat(35));
+        assert!(extract_keys(&format!("GOOGLE_API_KEY={key}"), Some("google")).is_empty());
+        let findings = extract_keys(&format!("GEMINI_API_KEY={key}"), Some("google"));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].0, "google");
+    }
+
+    #[test]
+    fn local_postgres_connection_string_is_rejected() {
+        assert!(extract_keys(
+            "DATABASE_URL=postgres://postgres:postgres@localhost:5432/app",
+            Some("postgres")
+        )
+        .is_empty());
+    }
 }
